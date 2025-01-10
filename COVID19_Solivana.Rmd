@@ -1,0 +1,810 @@
+---
+title: "COVID-19 Global Overview"
+author: "Team Solivana"
+output: 
+  flexdashboard::flex_dashboard:
+    vertical_layout: scroll
+    orientation: rows
+---
+Dashboard
+=====================================  
+```{r setup, include=FALSE, echo=FALSE}
+library(flexdashboard)
+# Main source code for BTC1855 Final
+# Authors: Hasan Abdo, Angela Bakaj, Youssef Emam
+# Date: Aug. 29th, 2024
+# Note for reviewer: Please set the working directory to the "datasets" folder.
+#import libraries
+library(tidyverse)
+library(tidyr)
+library(lubridate)
+library(ggplot2)
+library(wbstats)
+library(leaflet)
+library(htmltools)
+library(flexdashboard)
+
+#making sure data in the api is the most recent version
+#used for wb api queries 
+new_cache <- wb_cache()
+
+#Target dataset that we want for our visualizations (date range of 2020-2022)
+
+# country | Population | Confirmed cases |Confirmed Cases per 100K | Deaths | Deaths per 100K| Indicator 1 | Indicator 2 | Indicator 3 | Indicator 4 | Indicator 5
+
+#start by getting countries and cases
+#Read covid19 data
+covid <- read.csv("datasets/WHO-COVID-19-global-data-daily.csv", header = T)
+
+#Create df with all unique countries and country codes
+
+countries <- data.frame(Country_code = unique(covid$Country_code), Country = unique(covid$Country))
+
+#Summarise the data
+summary(covid)
+
+#convert dates to date format
+covid$Date_reported <- ymd(covid$Date_reported)
+
+#Keep data within correct date range
+covid <- covid %>% 
+  filter(Date_reported >= "2020-01-1", Date_reported <= "2022-12-31") %>%
+  
+  #summarize each column by calculating cumulative values
+  group_by(Country_code) %>% 
+  summarise(confirmed_cases = sum(New_cases, na.rm  = T),
+            deaths = sum(New_deaths, na.rm = T))
+
+
+
+#Join each country to it's row to add names not just codes
+covid <- left_join(covid, countries, by = join_by("Country_code" == "Country_code"))
+
+
+#Now we have:
+# country code | Cumulative Confirmed cases | Cumulative Deaths | country
+# We will keep country code to join on since it is standardized
+# Country names may be spelled differently (i.e with or without special characters)
+
+#lets add population
+#get data from WB using wbstats
+populations <- wb_data(indicator = "SP.POP.TOTL", cache = new_cache) %>% 
+  
+  #summarise by the average population over the time period
+  filter(date >= 2020, date <= 2023) %>%
+  group_by(iso2c) %>% 
+  summarise(population = as.integer(mean(SP.POP.TOTL, na.rm = T)))
+  
+# join population to the dataset
+covid <- left_join(covid, populations, by = join_by("Country_code" == "iso2c"))
+
+
+# now we have: 
+# country code | Confirmed cases | Deaths | country | Population
+# lets add confirmed cases per 100K
+covid <- covid %>% 
+  mutate(cases_per_100K = confirmed_cases/population*100000,
+         deaths_per_100k = (deaths/population*100000))
+
+
+#Now we will add indicators to the data frame
+
+#indicators of GNI
+gni_inds <- data.frame(wb_search(pattern ="GNI", cache = new_cache))
+
+#Use current GNI per capita in USD
+gni_data <- wb_data("NY.GNP.PCAP.CD", cache = new_cache)
+
+options(scipen = 999)
+
+#summarise each country by average DNI using atlas method
+gni_data <- gni_data %>%
+  filter(date >= 2020, date <= 2023) %>% 
+  group_by(iso2c) %>% 
+  summarise(GNI = (mean(NY.GNP.PCAP.CD, na.rm = T)))
+
+#join to main dataset
+covid <- left_join(covid, gni_data, join_by("Country_code" == "iso2c"))
+
+# population density
+pop_inds <- wb_search("EN.POP.DNST", cache = new_cache)
+
+#Summarise each country by average population density
+density_data <- wb_data("EN.POP.DNST", cache = new_cache) %>% 
+  filter(date >= 2020, date <= 2023) %>% 
+  group_by(iso2c) %>% 
+  summarise(Population_density = (mean(EN.POP.DNST, na.rm = T)))
+
+#join to main data
+covid <- left_join(covid, density_data, join_by("Country_code" == "iso2c"))
+
+# health indicator
+health_inds <- wb_search("Health", cache = new_cache)
+# SH.XPD.CHEX.PC.CD - Healthcare expenditure per capita (USD)
+
+#Summarise each country by  Health care expenditure
+health_data <- wb_data("SH.XPD.CHEX.PC.CD", cache = new_cache) %>% 
+  filter(date >= 2020, date <= 2023) %>% 
+  group_by(iso2c) %>% 
+  summarise(Health_expenditure = (mean(SH.XPD.CHEX.PC.CD, na.rm = T)))
+
+#join to main data
+covid <- left_join(covid, health_data, join_by("Country_code" == "iso2c"))
+
+
+#### Data processing ####
+#Creating columns where we calculate prevalence, Case Fatality Rate, and Mortality Rate
+#CFR = Case Fatality Rate
+#MR= Mortality Rate
+
+covid <- covid %>% 
+  mutate(prevelance = (confirmed_cases/population)*100,
+         CFR = deaths/confirmed_cases,
+         MR = deaths/population)
+
+
+library(corrplot)
+library(Hmisc)
+#setting up correlation variables that will be used the plot
+
+selected_variables <- covid %>% 
+  select(CFR, deaths, GNI, Population_density, Health_expenditure)
+
+#create correlation matrix for Indictors
+#computes correlation values and p-values for the data
+cor_plot <- rcorr(as.matrix(selected_variables))
+
+#clean the matrix to remove redundancy
+
+cor_plot$r <- as.matrix(cor_plot$r[1:2, c(-1,-2)])
+cor_plot$P <- as.matrix(cor_plot$P[1:2, c(-1,-2)])
+
+
+#plot the matrix, hide insignificant results (i.e H0: pearson coefficient = 0)
+corrplot(cor_plot$r, method = "shade", title = "indicator corplot", p.mat = cor_plot$P, sig.level = 0.05,tl.col = "black", tl.srt = 50, cl.pos = "b", cl.ratio = 0.7)
+
+#top 10 cases per 100k
+processing <- covid %>% 
+  arrange(desc(cases_per_100K)) %>% 
+  na.omit() %>% 
+  head(10) 
+  
+#total cases per 100k is less than 10,000 
+processing2 <- covid %>% 
+  na.omit() %>% 
+  filter(cases_per_100K < 10000)
+  
+#top 10 deaths per 100k
+processing3 <- covid %>% 
+  arrange(desc(deaths_per_100k)) %>% 
+  na.omit() %>% 
+  head(10) 
+  
+
+#total deaths per 100k is less than 250
+processing4 <- covid %>% 
+  na.omit() %>% 
+  filter(deaths_per_100k < 250) 
+
+#Based on the above queries, we selected the countries: France, Austria, Denmark, India, Congo, Egypt, Peru, Bulgaria, Georgia, Canada, Turkiye, Australia
+
+covid$Country[covid$Country == "T�rkiye"] <- "Türkiye"
+
+selected_countries <- c("Slovenia", "Austria", "Denmark", "India", "Congo", "Egypt", "Peru", "Bulgaria", "Georgia", "Canada", "Türkiye", "Australia")
+
+covid_selected <- covid %>% 
+  filter(Country %in% selected_countries)
+
+
+
+##### Country Categories #####
+
+#Starting off with the GNI categories, based on World Bank classifications for 2021-2022
+#Found here: https://blogs.worldbank.org/en/opendata/new-world-bank-country-classifications-income-level-2021-2022
+
+#The categories for population density were based off of thresholds found here: https://blogs.worldbank.org/en/sustainablecities/how-do-we-define-cities-towns-and-rural-areas
+
+#Calculating quantiles as categories for Health Expenditure 
+quantiles <- quantile(covid_selected$Health_expenditure, probs = c(0.25, 0.50, 0.75))
+
+
+#Creating GNI, population density, and health expenditure thresholds based on the values reported above 
+covid_thresholds <- covid_selected %>% 
+  group_by(Country) %>% 
+  mutate(income_group = case_when(
+    GNI < 1045 ~ "Low Income",
+    GNI >= 1046 & GNI <= 4095 ~ "Lower-Middle Income",
+    GNI >= 4096 & GNI <= 12695 ~ "Upper-Middle Income",
+    GNI > 12695 ~ "High Income"
+  )) %>% 
+  mutate(density_category = case_when(
+    Population_density < 300 ~ "Low Population Density",
+    Population_density >= 301 ~ "High Population Density"
+  )) %>% 
+  mutate(health_expenditure_category = case_when(
+    Health_expenditure < quantiles[1] ~ "Low Expenditure",
+    Health_expenditure >= quantiles[1] & Health_expenditure <= quantiles[3] ~ "Medium Expenditure",
+    Health_expenditure > quantiles[3] ~ "High Expenditure"
+  )) %>% 
+  ungroup()
+
+
+#converting the values to factors 
+covid_thresholds$income_group <- factor(covid_thresholds$income_group, levels = c("High Income", "Upper-Middle Income", "Lower-Middle Income", "Low Income"))
+
+covid_thresholds$density_category <- factor(covid_thresholds$density_category, levels = c("High Population Density", "Low Population Density"))
+
+
+covid_thresholds$health_expenditure_category <- factor(covid_thresholds$health_expenditure_category, levels = c("High Expenditure", "Medium Expenditure", "Low Expenditure"))
+
+#repeat process for df with all countries
+covid <- covid %>% 
+  group_by(Country) %>% 
+  mutate(income_group = case_when(
+    GNI < 1045 ~ "Low Income",
+    GNI >= 1046 & GNI <= 4095 ~ "Lower-Middle Income",
+    GNI >= 4096 & GNI <= 12695 ~ "Upper-Middle Income",
+    GNI > 12695 ~ "High Income"
+  )) %>% 
+  mutate(density_category = case_when(
+    Population_density < 300 ~ "Low Population Density",
+    Population_density >= 301 ~ "High Population Density"
+  )) %>% 
+  mutate(health_expenditure_category = case_when(
+    Health_expenditure < quantiles[1] ~ "Low Expenditure",
+    Health_expenditure >= quantiles[1] & Health_expenditure <= quantiles[3] ~ "Medium Expenditure",
+    Health_expenditure > quantiles[3] ~ "High Expenditure"
+  )) %>% 
+  ungroup()
+
+#converting the values to factors 
+covid$income_group <- factor(covid$income_group, levels = c("High Income", "Upper-Middle Income", "Lower-Middle Income", "Low Income"))
+
+covid$density_category <- factor(covid$density_category, levels = c("High Population Density", "Low Population Density"))
+
+
+covid$health_expenditure_category <- factor(covid$health_expenditure_category, levels = c("High Expenditure", "Medium Expenditure", "Low Expenditure"))
+
+
+##### Plots #####
+
+#summarize data, find mean CFR and SD
+summary_data <- covid_thresholds %>%
+  group_by(income_group) %>%
+  summarise(
+    mean_CFR = mean(CFR),
+    sd_CFR = sd(CFR),
+  )
+
+#Plot data
+ggplot(data = summary_data, aes(x = income_group, y = mean_CFR)) +
+  geom_point(size = 3, color = "red") +
+  geom_errorbar(aes(ymin = mean_CFR - sd_CFR, ymax = mean_CFR + sd_CFR), width = 0.2) +
+  geom_line(mapping = aes(group = 1), linetype = "dashed")+
+  theme_minimal() +
+  labs(title = "Mean Case Fatality Rate by World Bank Gross National Income Categories",
+       x = "GNI Income Category",
+       y = "Mean CFR Value")
+
+
+#create a model for anova
+incomeModel <- lm(CFR~income_group, data = covid_thresholds)
+
+#Test normality, underlying data is normal
+shapiro.test(residuals(incomeModel))
+
+# No statistically significant difference in mean CFR
+summary(aov(CFR~income_group, data = covid_thresholds))
+
+
+#Creating bar plot for CFR per country 
+ggplot(covid_thresholds, aes(x= Country, y= CFR, fill = CFR)) +
+  geom_col() +
+  scale_fill_gradient(low = "skyblue", high = "purple4", name = NULL) +
+  labs(title = "Case Fatality Rate by Country", 
+       x = "Country", 
+       y= "CFR") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "left",
+        legend.title = element_text(hjust = 0.5, angle = 90),
+        panel.background = element_rect(fill = "white"),
+        panel.grid.major.y = element_line(colour = "gainsboro"))
+
+#Creating bar plot for MR per country 
+ggplot(covid_thresholds, aes(x= Country, y= (MR*100), fill = (MR*100))) +
+  geom_col() +
+  scale_fill_gradient(low = "#96f3c9", high = "#205264", name = NULL) +
+  labs(title = "Mortality Rate by Country", 
+       x = "Country", 
+       y= "Mortality Rate (%)") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "left",
+        legend.title = element_text(hjust = 0.5, angle = 90),
+        panel.background = element_rect(fill = "white"),
+        panel.grid.major.y = element_line(colour = "gainsboro"))
+
+library(rnaturalearth)
+library(rnaturalearthdata)
+#create a dataset with countries, and join the income levels
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+#Rename the France iso_code
+world$iso_a2[world$iso_a3_eh == "FRA"] <- "FR"
+world$iso_a2[world$iso_a3_eh == "NOR"] <- "NO"
+
+
+#Join the covid data data with the mapping data
+world_withdata <- (left_join(world, covid_thresholds, by = join_by("iso_a2" == "Country_code")))
+
+#create another version with data for all countries
+world_withdata_all <- (left_join(world, covid, by = join_by("iso_a2" == "Country_code")))
+
+```
+
+## Row {data-height="120"}
+
+### Description
+
+``` {r DescriptionBox, include=TRUE, echo=FALSE}
+valueBox(
+  value= NULL,
+  caption= "This is a COVID-19 Overview Dashboard created by Team Solivana. Here we have displayed the prevalence, case fatality and mortality rates, as well as the mean case fatality rate across GNI income categories. This analysis is based on data collected between the years 2020-2023 across the 12 countries we have selected below. These countries were selected with the aim of diversifying the spread across different continents while ensuring different assumed socioeconomic conditions were represented.",
+  icon = NULL,
+  color= "white"
+)
+
+```
+
+## Row {data-height="100"}
+
+### Country 1
+
+```{r DisplayCountries, include=TRUE, echo=FALSE}
+
+#all flag images were taken from https://flagpedia.net/download/api
+
+#creating a value box with a flag and country name
+valueBox(
+  value = " ",
+  caption = HTML('<div style="display:flex; flex-direction:column; align-items:center;">
+                   <img src="https://flagcdn.com/si.svg" style="width:50px;height:35px;">
+                   <span style="font-size:18px;">Slovenia</span>
+                 </div>'),
+  icon = NULL,
+  color = NULL
+)
+```
+
+### Country 2
+
+```{r DisplayCountries2, include=TRUE, echo=FALSE}
+valueBox(
+  value = " ",
+  caption = HTML('<div style="display:flex; flex-direction:column; align-items:center;">
+                   <img src="https://flagcdn.com/at.svg" style="width:50px;height:35px;">
+                   <span style="font-size:18px;">Austria</span>
+                 </div>'),
+  icon = NULL,
+  color = NULL
+)
+```
+
+### Country 3
+
+```{r DisplayCountries3, include=TRUE, echo=FALSE}
+valueBox(
+  value = " ",
+  caption = HTML('<div style="display:flex; flex-direction:column; align-items:center;">
+                   <img src="https://flagcdn.com/dk.svg" style="width:50px;height:35px;">
+                   <span style="font-size:18px;">Denmark</span>
+                 </div>'),
+  icon = NULL,
+  color = NULL
+)
+```
+
+### Country 4
+
+```{r DisplayCountries4, include=TRUE, echo=FALSE}
+valueBox(
+  value = " ",
+  caption = HTML('<div style="display:flex; flex-direction:column; align-items:center;">
+                   <img src="https://flagcdn.com/in.svg" style="width:50px;height:35px;">
+                   <span style="font-size:18px;">India</span>
+                 </div>'),
+  icon = NULL,
+  color = NULL
+)
+```
+
+### Country 5
+
+```{r DisplayCountries5, include=TRUE, echo=FALSE}
+valueBox(
+  value = " ",
+  caption = HTML('<div style="display:flex; flex-direction:column; align-items:center;">
+                   <img src="https://flagcdn.com/cg.svg" style="width:50px;height:35px;">
+                   <span style="font-size:18px;">Congo</span>
+                 </div>'),
+  icon = NULL,
+  color = NULL
+)
+```
+
+### Country 6
+
+```{r DisplayCountries6, include=TRUE, echo=FALSE}
+valueBox(
+  value = " ",
+  caption = HTML('<div style="display:flex; flex-direction:column; align-items:center;">
+                   <img src="https://flagcdn.com/eg.svg" style="width:50px;height:35px;">
+                   <span style="font-size:18px;">Egypt</span>
+                 </div>'),
+  icon = NULL,
+  color = NULL
+)
+```
+
+### Country 7
+
+```{r DisplayCountries7, include=TRUE, echo=FALSE}
+valueBox(
+  value = " ",
+  caption = HTML('<div style="display:flex; flex-direction:column; align-items:center;">
+                   <img src="https://flagcdn.com/pe.svg" style="width:50px;height:35px;">
+                   <span style="font-size:18px;">Peru</span>
+                 </div>'),
+  icon = NULL,
+  color = NULL
+)
+```
+
+### Country 8
+
+```{r DisplayCountries8, include=TRUE, echo=FALSE}
+valueBox(
+  value = " ",
+  caption = HTML('<div style="display:flex; flex-direction:column; align-items:center;">
+                   <img src="https://flagcdn.com/bg.svg" style="width:50px;height:35px;">
+                   <span style="font-size:18px;">Bulgaria</span>
+                 </div>'),
+  icon = NULL,
+  color = NULL
+)
+```
+
+### Country 9
+
+```{r DisplayCountries9, include=TRUE, echo=FALSE}
+valueBox(
+  value = " ",
+  caption = HTML('<div style="display:flex; flex-direction:column; align-items:center;">
+                   <img src="https://flagcdn.com/ge.svg" style="width:50px;height:35px;">
+                   <span style="font-size:18px;">Georgia</span>
+                 </div>'),
+  icon = NULL,
+  color = NULL
+)
+```
+
+### Country 10
+
+```{r DisplayCountries10, include=TRUE, echo=FALSE}
+valueBox(
+  value = " ",
+  caption = HTML('<div style="display:flex; flex-direction:column; align-items:center;">
+                   <img src="https://flagcdn.com/ca.svg" style="width:50px;height:35px;">
+                   <span style="font-size:18px;">Canada</span>
+                 </div>'),
+  icon = NULL,
+  color = NULL
+)
+```
+
+### Country 11
+
+```{r DisplayCountries11, include=TRUE, echo=FALSE}
+valueBox(
+  value = " ",
+  caption = HTML('<div style="display:flex; flex-direction:column; align-items:center;">
+                   <img src="https://flagcdn.com/tr.svg" style="width:50px;height:35px;">
+                   <span style="font-size:18px;">Türkiye</span>
+                 </div>'),
+  icon = NULL,
+  color = NULL
+)
+```
+
+### Country 12
+
+```{r DisplayCountries12, include=TRUE, echo=FALSE}
+valueBox(
+  value = " ",
+  caption = HTML('<div style="display:flex; flex-direction:column; align-items:center;">
+                   <img src="https://flagcdn.com/au.svg" style="width:50px;height:35px;">
+                   <span style="font-size:18px;">Australia</span>
+                 </div>'),
+  icon = NULL,
+  color = NULL
+)
+```
+
+## Row {data-height="170"}
+
+### Description2
+``` {r DescriptionBox2, include=TRUE, echo=FALSE}
+valueBox(
+  value= NULL,
+  caption= "Below we have three visualizations for the following COVID-19 statistics: prevalence, case fatlity rate, and mortailty rate. Prevalence is the number of cases of COVID-19 expressed as a percentage of the population in each country. Case Fatality Rate is described as the portion of cases of COVID-19 which resulted in death. Mortality Rate is then the portion of deaths caused by COVID-19 in each population. In general, it is evident that Case Fatality Rate is stronly associated with Mortality Rate. When examining the prevalence map, a notable trend emerges: developed nations tend to show higher COVID-19 prevalence rates compared to developing nations. This pattern appears to be inversely related to GNI and healthcare spending. We hypothesize that this discrepancy could be attributed to higher population density in urban areas of developed countries, along with more comprehensive testing and case reporting. Further analyses are necessary to validate these hypotheses.",
+  icon = NULL,
+  color= "white"
+)
+
+```
+
+
+## Row {data-height="500"}
+
+### Prevalence of COVID-19
+
+```{r prevalence, include=TRUE, echo=FALSE}
+# Creating a function using leaflet package to assign colours to countries based on prevelance
+countryColor <- colorNumeric(
+  palette = c("orange", "salmon", "#FF5733"),
+  domain = world_withdata_all$prevelance,
+  na.color = NA
+  )
+
+# Drawing the map
+leaflet() %>%
+  addProviderTiles("CartoDB.Positron",
+                   options = tileOptions(noWrap = T)) %>% 
+  setView(lng = 0, lat = 20, zoom = 2.5) %>%
+  addPolygons(data = world_withdata_all,
+              weight = 1,
+              color = ~countryColor(world_withdata_all$prevelance),
+              popup = ~paste("<b>Country:</b> ", world_withdata_all$Country, "<br>", 
+                             "<b>Prevalence:</b> ", round(world_withdata_all$prevelance,2), "%")) %>% 
+
+# Creating a legend
+   addLegend(
+    pal = countryColor,  
+    values = world_withdata_all$prevelance,  
+    title = "Prevalence (%)",  
+    position = "bottomright",
+    labFormat = labelFormat(transform = function(x) sort(x)),
+    na.label = NA
+    )
+  
+```
+
+## Row {data-height="500"}
+
+### COVID-19 Case Fatality Rate
+
+```{r CFR, fig.width=10,fig.height=7, include=TRUE, echo=FALSE}
+ggplot(covid_thresholds, aes(x= Country, y= CFR, fill = CFR)) +
+  geom_col() +
+  scale_fill_gradient(low = "skyblue", high = "purple4", name = NULL) +
+  labs(title = "Case Fatality Rate by Country", 
+       x = "Country", 
+       y= "CFR") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "left",
+        legend.title = element_text(hjust = 0.5, angle = 90),
+        panel.background = element_rect(fill = "white"),
+        panel.grid.major.y = element_line(colour = "gainsboro"))
+```
+
+### COVID-19 Mortality Rate
+
+```{r MR, fig.width=10,fig.height=7, include=TRUE, echo=FALSE}
+ggplot(covid_thresholds, aes(x= Country, y= (MR*100), fill = (MR*100))) +
+  geom_col() +
+  scale_fill_gradient(low = "#96f3c9", high = "#205264", name = NULL) +
+  labs(title = "Mortality Rate by Country", 
+       x = "Country", 
+       y= "Mortality Rate (%)") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = "left",
+        legend.title = element_text(hjust = 0.5, angle = 90),
+        panel.background = element_rect(fill = "white"),
+        panel.grid.major.y = element_line(colour = "gainsboro"))
+```
+
+## Row {data-height="95"}
+
+### Description3
+``` {r DescriptionBox3, include=TRUE, echo=FALSE}
+valueBox(
+  value= NULL,
+  caption= "Below are three interactive maps of the following COVID-19 socioeconomic indicators: Gross National Income (GNI) per capita, Population Density (people/sqKm), and Health Expenditure per capita (USD). Among these indicators, GNI was determeined to have the strongest correlation with Case Fatality Rate.",
+  icon = NULL,
+  color= "white"
+)
+
+```
+
+## Row {.tabset data-height="500"}
+
+### GNI by Country
+
+```{r GNI, include=TRUE, echo=FALSE}
+# Comment
+countryColor <- colorFactor(
+  palette = c("#FF5733", "orange", "yellow"),
+  domain = world_withdata$income_group,
+  levels = c("High Income", "Upper-Middle Income", "Lower-Middle Income"),
+  na.color = NA)
+
+leaflet() %>%
+  addProviderTiles("CartoDB.Positron",
+                   options = tileOptions(noWrap = T)) %>% 
+   setView(lng = 0, lat = 20, zoom = 2.5) %>%
+  addPolygons(data = world_withdata,
+              weight = 1,
+              color = ~countryColor(world_withdata$income_group),
+              popup = ~paste("<b>Country:</b> ", world_withdata$Country, "<br>", 
+                             "<b>GNI:</b> ", as.integer(world_withdata$GNI), "<br>",
+                             "<b>Income Group:</b> ", world_withdata$income_group)) %>%
+addLegend(
+  pal = countryColor,  
+  values = world_withdata$income_group,  
+  title = "Income Group",  
+  position = "bottomright",
+  na.label = NA
+  )
+```
+
+### Population Density by Country
+
+```{r PopDen, include=TRUE, echo=FALSE}
+# Comment
+countryColor <- colorFactor(
+  palette = c("#FF5733", "yellow"),
+  domain = world_withdata$density_category,
+  levels = c("High Population Density", "Low Population Density"),
+  na.color = NA)
+
+leaflet() %>%
+  addProviderTiles("CartoDB.Positron",
+                   options = tileOptions(noWrap = T)) %>% 
+   setView(lng = 0, lat = 20, zoom = 2.5) %>%
+  addPolygons(data = world_withdata,
+              weight = 1,
+              color = ~countryColor(world_withdata$density_category),
+              popup = ~paste("<b>Country:</b> ", world_withdata$Country, "<br>", 
+                             "<b>Population Density:</b> ", as.integer(world_withdata$Population_density), "<br>",
+                             "<b>Density Category:</b> ", world_withdata$density_category)) %>%
+addLegend(
+  pal = countryColor,  
+  values = world_withdata$density_category,  
+  title = "Population Density",  
+  position = "bottomright",
+  na.label = NA
+  )
+```
+
+### Health Expenditure by Country
+
+```{r HealthExp, include=TRUE, echo=FALSE}
+# Comment
+countryColor <- colorFactor(
+  palette = c("#FF5733","orange", "yellow"),
+  domain = world_withdata$health_expenditure_category,
+  levels = c("High Expenditure", "Medium Expenditure", "Low Expenditure"),
+  na.color = NA)
+
+leaflet() %>%
+  addProviderTiles("CartoDB.Positron",
+                   options = tileOptions(noWrap = T)) %>% 
+   setView(lng = 0, lat = 20, zoom = 2.5) %>%
+  addPolygons(data = world_withdata,
+              weight = 1,
+              color = ~countryColor(world_withdata$health_expenditure_category),
+              popup = ~paste("<b>Country:</b> ", world_withdata$Country, "<br>", 
+                             "<b>Health Expenditure:</b> ", as.integer(world_withdata$Health_expenditure), "<br>",
+                             "<b>Health Expenditure Category:</b> ", world_withdata$health_expenditure_category)) %>%
+addLegend(
+  pal = countryColor,  
+  values = world_withdata$health_expenditure_category,  
+  title = "Health Expenditure",  
+  position = "bottomright",
+  na.label = NA
+  )
+```
+
+## Row {data-height="80"}
+
+### Description4
+``` {r DescriptionBox4, include=TRUE, echo=FALSE}
+valueBox(
+  value= NULL,
+  caption= "Below is a plot of the mean Case Fatality Rate per GNI income group (+/- standard deviation), there was no statistically significant difference found between the three groups. Further analysis is required to investigate the impact of the remaining socioeconomic indicators on COVID-19 CFR.",
+  icon = NULL,
+  color= "white"
+)
+
+```
+
+## Row {data-height="500"}
+
+### Mean Case Fatality Rate across Income Categories
+
+```{r DNI_Anova, include=TRUE, echo=FALSE}
+ggplot(data = summary_data, aes(x = income_group, y = mean_CFR)) +
+  geom_point(size = 3, color = "red") +
+  geom_errorbar(aes(ymin = mean_CFR - sd_CFR, ymax = mean_CFR + sd_CFR), width = 0.2) +
+  geom_line(mapping = aes(group = 1), linetype = "dashed")+
+  theme_minimal() +
+  labs(title = "Mean Case Fatality Rate by \n World Bank Gross National Income Categories",
+       x = "GNI Income Category",
+       y = "Mean CFR Value") +
+  theme(plot.title = element_text(hjust = 0.5))
+```
+
+About
+=====================================
+
+## Row {data-height="100"}
+
+### About
+``` {r About, include=TRUE, echo=FALSE}
+valueBox(
+  value= NULL,
+  caption= "\n\nABOUT\n\n\n",
+  icon = NULL,
+  color= "white"
+)
+
+```
+
+## Row {data-height="300"}
+
+### Threshold determination
+
+``` {r Thresholds, include=TRUE, echo=FALSE}
+valueBox(
+  value= NULL,
+  caption= "Determining Thresholds: When creating thresholds for our data we first searched for publicly available cutoff values. For GNI per capita, we found that the world bank published cutoff values of 12695 as high income, between 4695 and 12695 as upper-middle income, between 1046 and 4095 as lower-middle income, and anything including or below 1045 USD per capita as low income.\n\n With regards to population denisty sparse areas are defined as having less than 300 people per square kilometer, while semi-dense areas are those between 301 and 1500 people per square kilometer. We Binarized these values to be low and high, since none of the chosen countries had a population denisty greater than 1500. It should also be noted that these cutoffs are typically used for regions smaller than an entire country, such as a town or a city. However we adapted the cutoffs to be used on the country level since our data was not granular enough to encompass regional densities in the analysis.\n\n Lastly, we could not find available cutoff values for healthcare spending per capita, so we opted to categorize that data based on quantiles. Any data falling below the 25th percentile was categorized as low, anything between the 25th and 75th percentile was categorized as medium expenditure, and anything above the 75th percentile was categorized as high.",
+  icon = NULL,
+  color= "white"
+)
+
+```
+
+## Row {data-height="300"}
+
+### Indicator Determination
+
+``` {r Indicator determination, include=TRUE, echo=FALSE}
+valueBox(
+  value= NULL,
+  caption= "Determinating Socioeconomic Indicators: In order to determine which indicator correlated best with the data we created a corrplot. We determined the pearson correlation between CFR and our chosen metrics (before categorization) and visualized them as a heatmap. This plot can be visualized below. Any insignificant correlations were marked with an X. Overall we found that GNI correlated most strongly with case fatality rate, and thus we chose to use GNI as our primary socioeconomic indicator for subsequent analyses.",
+  icon = NULL,
+  color= "white"
+)
+
+```
+
+## Row {data-height="200"}
+
+### Assumptions
+
+``` {r Assumptions, include=TRUE, echo=FALSE}
+valueBox(
+  value= "",
+  caption= "Assumptions: We aggregated the data over the course of the 3 year period. We took all data entries from Jan. 1st 2020 until Dec. 31st 2023. With regards to dynamic metrics such as population we decided to take an average over the time period to capture a representative estimate of the value.",
+  icon = NULL,
+  color= "white"
+)
+
+```
+
+## Row {data-height="500"}
+
+### Heat map showing perason correlation between CFR and socioeconomic indicators
+
+``` {r corrplot, include=TRUE, echo=FALSE}
+corrplot(cor_plot$r, method = "shade", title = "Indicator corrplot", p.mat = cor_plot$P, sig.level = 0.05,tl.col = "black", tl.srt = 50, cl.pos = "b", cl.ratio = 0.7, mar = c(1,1,1,1))
+```
